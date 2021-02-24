@@ -1,0 +1,132 @@
+// Disk space percentage free (rounded) and min threshold
+// set FreeSpaceThreshold and Period
+// as-is shows all computers that had less than 10% of free space in the last 24 hours
+let FreeSpaceThreshold=10;
+let Period=ago(1d);
+Perf 
+| where TimeGenerated > Period 
+| where ObjectName == "LogicalDisk" and InstanceName contains ":"
+| where CounterName == "% Free Space"  
+| summarize FreeSpace_Percent = round(min(CounterValue)) by Computer, InstanceName 
+| project Computer, InstanceName, FreeSpace_Percent 
+| where FreeSpace_Percent < FreeSpaceThreshold  
+| order by Computer asc nulls last 
+
+
+// Disk space percentage free (rounded) in time
+// timechart generated on 15 minute intervals for every pair Computer-Drive
+// set Period
+let Period=ago(12h);
+Perf 
+| where TimeGenerated > Period 
+| where ObjectName == "LogicalDisk" and InstanceName contains ":"
+| where CounterName == "% Free Space"  
+| summarize FreeSpace_Percent = round(min(CounterValue)) by bin(TimeGenerated, 15m), Disk=strcat(Computer," - ", InstanceName) 
+| project TimeGenerated, Disk, FreeSpace_Percent 
+| render timechart 
+
+
+// Windows Event Logs
+// can parse the ParameterXml to extract stuff like Application ID
+Event
+| where TimeGenerated > ago(7d)
+| where EventLevelName in ("Error", "Warning") 
+//| parse kind=relaxed ParameterXml with * "Application ID: " ApplicationID "Process ID" * 
+| project TimeGenerated, EventLog, Source, EventID, RenderedDescription, _ResourceId
+
+
+// Last hearbeat by computer
+Heartbeat 
+| summarize LastHeartbeat=max(TimeGenerated) by Computer
+
+
+// Windows service unclean stop
+Event 
+| where TimeGenerated > ago(30d) 
+| where EventID == 7031 or EventID == 7034 or EventID == 7036  
+| parse kind=relaxed EventData with * "<Data Name=\"param1\">" ServiceName "</Data><Data Name=\"param2\">" ServiceState "</Data><Binary>" ServiceBinary "/Binary>" * 
+| where ServiceState == "stopped" 
+| project TimeGenerated, Computer, ServiceName, ServiceState, RenderedDescription, EventID, EventLog, EventLevel, EventLevelName, Source, SourceSystem, EventData  
+
+
+
+// Availability rate in percent and hours 
+// periodo riferito alle ultime 24 ore 
+Heartbeat 
+| summarize heartbeatPerHour = count() by bin_at(TimeGenerated, 1h, ago(24h)), Computer 
+| extend availablePerHour = iff(heartbeatPerHour > 0, true, false) 
+| summarize totalAvailableHours = countif(availablePerHour == true) by Computer  
+| extend availabilityRate = totalAvailableHours*100.0/24 
+
+
+// Chart all computers' used memory and CPU, over the last 24 hours 
+Perf 
+| where TimeGenerated > ago(24h) 
+| where (CounterName == "% Processor Time" and InstanceName == "_Total")  
+| project TimeGenerated, CounterName, Processor_Time=CounterValue, Computer  
+| summarize avg(Processor_Time) by Computer, bin(TimeGenerated, 15m) 
+| render timechart 
+
+
+// Memory usage 
+// Chart all computers' used memory, over the last 24 hours 
+Perf 
+| where TimeGenerated > ago(1d) 
+| where CounterName == "% Used Memory"  
+| project TimeGenerated, CounterName, RAM_Used=CounterValue, Computer  
+| summarize avg(RAM_Used) by Computer, bin(TimeGenerated, 15m) 
+| render timechart 
+
+
+
+// free space 
+Perf 
+| where TimeGenerated > ago(15m) 
+| where ObjectName == "Logical Disk" and CounterName == "Free Megabytes" 
+| where InstanceName startswith "/" 
+| summarize FreeSpace_GB = round(min(CounterValue/1024)) by Computer, InstanceName 
+| project Computer, InstanceName, FreeSpace_GB 
+| order by Computer asc, InstanceName asc 
+| render barchart kind=unstacked  
+
+
+
+// Sustained high CPU utilization in the last 24 H
+// maxValue = cpu threshold 
+let _maxValue = 10;  
+let _timeWindow = 24h;  
+let _AvgCpu = Perf  
+| where TimeGenerated >= ago(_timeWindow)  
+| where CounterName == "% Processor Time" and InstanceName =~ "_Total"  
+| summarize mtgPerf=max(TimeGenerated) 
+, CounterValue=round(avg(CounterValue)) 
+, SampleCount=count(CounterValue) by Computer, InstanceName, CounterName, ObjectName;  
+_AvgCpu  
+| where CounterValue > _maxValue  
+| project Computer 
+, ObjectName 
+, CounterName  
+, InstanceName  
+, TimeGenerated=mtgPerf  
+, CounterValue  
+, AlertType_s = "Sustained High CPU \r\nUtilization"  
+, Severity = 4  
+, SeverityName_s = "WARNING"  
+, AlertDetails_s = strcat("Compter: ", Computer, " - Average CPU Utilization: ", CounterValue, " - %Sample Period: Last ", _timeWindow, " - Sample Count: ", SampleCount, " - Alert Threshold: > ", _maxValue, "%") 
+| summarize AggregatedValue = count() by bin(TimeGenerated, 30m) 
+, Computer  
+, CounterName  
+, InstanceName 
+, CounterValue 
+, AlertType_s  
+, AlertDetails_s 
+
+
+// SQL Jobs failed
+Event  
+| where TimeGenerated > ago(7d)  
+| where Source == "SQLSERVERAGENT"  
+| where ParameterXml !has "Succeeded"  
+| parse kind=relaxed ParameterXml with * '<Param>' errmsg '</Param>' blabla 'The last step to run was ' lastStep '.</Param>' * 
+| project TimeGenerated , Source , EventLevel , EventLevelName , errmsg , lastStep , ParameterXml  
+| order by TimeGenerated desc nulls first  
